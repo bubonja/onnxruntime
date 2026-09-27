@@ -101,7 +101,114 @@ void ExpectNotFused(const std::function<void(ModelTestBuilder&)>& build,
       TransformerLevel::Level3, 1, pre_checker, post_checker));
 }
 
+// X -> Mul -> Q16 -> {DQ, Transpose -> DQ, Slice -> Unsqueeze -> DQ, Split -> (DQ, DQ), Gather -> DQ,
+// Reshape -> DQ}, each DQ followed by Relu -> output.
+std::function<void(ModelTestBuilder&)> BuildDataMovementTree() {
+  return [](ModelTestBuilder& builder) {
+    NodeArg* x = builder.MakeInput<float>({2, 6, 40}, -15.0f, 15.0f);
+    NodeArg* scaled = builder.MakeIntermediate();
+    builder.AddNode("Mul", {x, builder.MakeScalarInitializer<float>(0.75f)}, {scaled});
+    NodeArg* q = builder.MakeIntermediate();
+    builder.AddQuantizeLinearNode<uint16_t>(scaled, 0.0004f, static_cast<uint16_t>(30000), q);
+    auto add_dq_relu = [&](NodeArg* quantized) {
+      NodeArg* dq = builder.MakeIntermediate();
+      builder.AddDequantizeLinearNode<uint16_t>(quantized, 0.0004f, static_cast<uint16_t>(30000), dq);
+      builder.AddNode("Relu", {dq}, {builder.MakeOutput()});
+    };
+    auto add_op = [&](const std::string& op, std::vector<NodeArg*> inputs, size_t num_outputs = 1,
+                      const NodeAttributes* attrs = nullptr) {
+      std::vector<NodeArg*> outputs;
+      for (size_t i = 0; i < num_outputs; ++i) {
+        outputs.push_back(builder.MakeIntermediate());
+      }
+      builder.AddNode(op, inputs, outputs, "", attrs);
+      return outputs;
+    };
+
+    add_dq_relu(q);
+
+    NodeAttributes perm;
+    utils::SetNodeAttribute(utils::MakeAttribute("perm", std::vector<int64_t>{0, 2, 1}), perm);
+    add_dq_relu(add_op("Transpose", {q}, 1, &perm)[0]);
+
+    NodeArg* sliced = add_op("Slice", {q, builder.Make1DInitializer<int64_t>({1}), builder.Make1DInitializer<int64_t>({5}),
+                                       builder.Make1DInitializer<int64_t>({1})})[0];
+    add_dq_relu(add_op("Unsqueeze", {sliced, builder.Make1DInitializer<int64_t>({0})})[0]);
+
+    NodeAttributes split;
+    utils::SetNodeAttribute(utils::MakeAttribute("axis", static_cast<int64_t>(2)), split);
+    utils::SetNodeAttribute(utils::MakeAttribute("num_outputs", static_cast<int64_t>(2)), split);
+    for (NodeArg* part : add_op("Split", {q}, 2, &split)) {
+      add_dq_relu(part);
+    }
+
+    NodeAttributes gather;
+    utils::SetNodeAttribute(utils::MakeAttribute("axis", static_cast<int64_t>(1)), gather);
+    add_dq_relu(add_op("Gather", {q, builder.Make1DInitializer<int64_t>({0, 2})}, 1, &gather)[0]);
+
+    add_dq_relu(add_op("Reshape", {q, builder.Make1DInitializer<int64_t>({2, 240})})[0]);
+  };
+}
+
 }  // namespace
+
+TEST(QuantizeDequantizeLinearFusionTests, ThroughDataMovementOps) {
+  auto post = [](Graph& graph) {
+    ExpectFused(graph, 1);
+    const auto op_count = CountOpsInGraph(graph);
+    for (const char* op : {"Transpose", "Slice", "Unsqueeze", "Split", "Gather", "Reshape"}) {
+      EXPECT_EQ(OpCount(op_count, op), 1) << op;
+    }
+    for (const auto& node : graph.Nodes()) {
+      if (node.OpType() == "Relu" || node.OpType() == "Mul") {
+        continue;
+      }
+      for (const NodeArg* output : node.OutputDefs()) {
+        EXPECT_EQ(output->TypeAsProto()->tensor_type().elem_type(), ONNX_NAMESPACE::TensorProto_DataType_FLOAT)
+            << node.OpType() << " " << output->Name();
+      }
+    }
+    return Status::OK();
+  };
+  ASSERT_STATUS_OK(TestGraphTransformer(
+      BuildDataMovementTree(), 21, DefaultLoggingManager().DefaultLogger(),
+      std::make_unique<QuantizeDequantizeLinearFusion>(InlinedHashSet<std::string_view>{kCpuExecutionProvider}),
+      TransformerLevel::Level3, 1, AssignAllNodesToCpu, post));
+
+  RunPipeline(BuildDataMovementTree(), [](InferenceSessionWrapper& session) { ExpectFused(session.GetGraph(), 1); });
+}
+
+TEST(QuantizeDequantizeLinearFusionTests, NotFused_DataMovementOutputsNotOnlyDQ) {
+  // Q -> Transpose -> X, where X is a uint16 graph output, a DQ graph output, a DQ with another scale, or a Cast.
+  for (const char* variant : {"quantized output", "dq output", "dq scale", "cast"}) {
+    SCOPED_TRACE(variant);
+    ExpectNotFused([variant](ModelTestBuilder& builder) {
+      const std::string v = variant;
+      NodeArg* q = builder.MakeIntermediate();
+      builder.AddQuantizeLinearNode<uint16_t>(builder.MakeInput<float>({2, 8}, -1.0f, 1.0f), 0.001f,
+                                              static_cast<uint16_t>(32768), q);
+      NodeArg* dq = builder.MakeIntermediate();
+      builder.AddDequantizeLinearNode<uint16_t>(q, 0.001f, static_cast<uint16_t>(32768), dq);
+      builder.AddNode("Relu", {dq}, {builder.MakeOutput()});
+
+      NodeArg* transposed = v == "quantized output" ? builder.MakeOutput() : builder.MakeIntermediate();
+      builder.AddNode("Transpose", {q}, {transposed});
+      if (v == "dq output" || v == "dq scale") {
+        NodeArg* dq_out = v == "dq output" ? builder.MakeOutput() : builder.MakeIntermediate();
+        builder.AddDequantizeLinearNode<uint16_t>(transposed, v == "dq scale" ? 0.002f : 0.001f,
+                                                  static_cast<uint16_t>(32768), dq_out);
+        if (v == "dq scale") {
+          builder.AddNode("Relu", {dq_out}, {builder.MakeOutput()});
+        }
+      } else if (v == "cast") {
+        NodeAttributes to;
+        utils::SetNodeAttribute(utils::MakeAttribute("to", static_cast<int64_t>(ONNX_NAMESPACE::TensorProto_DataType_FLOAT)),
+                                to);
+        builder.AddNode("Cast", {transposed}, {builder.MakeOutput()}, "", &to);
+      }
+    });
+  }
+}
 
 TEST(QuantizeDequantizeLinearFusionTests, InteriorPairIsBitExact) {
   // The larger shape is not a multiple of 128 elements and runs on several threads.

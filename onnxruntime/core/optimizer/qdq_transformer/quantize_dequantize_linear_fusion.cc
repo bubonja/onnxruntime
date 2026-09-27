@@ -3,12 +3,22 @@
 
 #include "core/optimizer/qdq_transformer/quantize_dequantize_linear_fusion.h"
 
+#include <algorithm>
+#include <array>
+#include <optional>
+#include <string_view>
+
 #include "core/graph/constants.h"
 #include "core/graph/graph_utils.h"
 #include "core/optimizer/qdq_transformer/qdq_util.h"
 
 namespace onnxruntime {
 namespace {
+
+// Ops that only move or select elements of their first input, so they give the same values on dequantized data.
+constexpr std::array<std::string_view, 13> kDataMovementOps = {
+    "DepthToSpace", "Expand", "Flatten", "Gather", "Identity", "Reshape", "Slice",
+    "SpaceToDepth", "Split", "Squeeze", "Tile", "Transpose", "Unsqueeze"};
 
 int32_t ElemType(const NodeArg& arg) {
   const auto* type = arg.TypeAsProto();
@@ -19,6 +29,11 @@ int32_t ElemType(const NodeArg& arg) {
 bool HasNoBlockSize(const Node& node) {
   const auto* block_size = graph_utils::GetNodeAttribute(node, "block_size");
   return block_size == nullptr || block_size->i() == 0;
+}
+
+bool IsDataMovementOp(const Node& node) {
+  return node.Domain() == kOnnxDomain &&
+         std::find(kDataMovementOps.begin(), kDataMovementOps.end(), node.OpType()) != kDataMovementOps.end();
 }
 
 bool IsFusableQ(const Graph& graph, const Node& q_node, const QDQ::GetConstantInitializerFn& get_constant_initializer,
@@ -45,32 +60,75 @@ bool IsFusableQ(const Graph& graph, const Node& q_node, const QDQ::GetConstantIn
   return QDQ::IsQOrDQScalePositiveConstantScalar(graph, q_node, get_constant_initializer, graph.ModelPath());
 }
 
-// Returns the DQ consumers of q_node if every consumer is a DQ with the same scale and zero point. The DQ that
-// produces a graph output, if any, is placed first.
-InlinedVector<Node*> GetFusableDQs(Graph& graph, const Node& q_node,
-                                   const QDQ::GetConstantInitializerFn& get_constant_initializer) {
-  InlinedVector<Node*> dq_nodes;
-  size_t graph_output_count = 0;
-  for (auto it = q_node.OutputEdgesBegin(), end = q_node.OutputEdgesEnd(); it != end; ++it) {
-    Node* dq_node = graph.GetNode(it->GetNode().Index());
-    if (it->GetDstArgIndex() != QDQ::InputIndex::INPUT_ID || !QDQ::MatchDQNode(*dq_node) ||
-        dq_node->GetExecutionProviderType() != q_node.GetExecutionProviderType() || !HasNoBlockSize(*dq_node) ||
-        ElemType(*dq_node->OutputDefs()[0]) != ONNX_NAMESPACE::TensorProto_DataType_FLOAT ||
-        !QDQ::IsQDQPairSupported(graph, q_node, *dq_node, get_constant_initializer, graph.ModelPath(), false)) {
-      return {};
-    }
+struct DQLeaf {
+  Node* dq_node;
+  NodeIndex producer;
+  int producer_output;
+};
 
-    if (graph.NodeProducesGraphOutput(*dq_node)) {
-      if (++graph_output_count > 1) {
-        return {};
+struct QuantizedTree {
+  // The DQ that produces a graph output, if any, is first.
+  InlinedVector<DQLeaf> dq_leaves;
+  // Each node's quantized input comes from the Q node or an earlier entry.
+  InlinedVector<Node*> data_movement_nodes;
+};
+
+// Succeeds if every use of the Q output reaches a DQ with the same scale and zero point, directly or through
+// data-movement ops. Only a direct DQ may produce a graph output, since the fused node takes over its output.
+std::optional<QuantizedTree> CollectQuantizedTree(Graph& graph, const Node& q_node,
+                                                  const QDQ::GetConstantInitializerFn& get_constant_initializer) {
+  const int32_t quantized_type = ElemType(*q_node.InputDefs()[QDQ::InputIndex::ZERO_POINT_ID]);
+  QuantizedTree tree;
+  bool has_graph_output_dq = false;
+  InlinedVector<const Node*> producers{&q_node};
+  for (size_t i = 0; i < producers.size(); ++i) {
+    const Node& producer = *producers[i];
+    for (auto it = producer.OutputEdgesBegin(), end = producer.OutputEdgesEnd(); it != end; ++it) {
+      Node* consumer = graph.GetNode(it->GetNode().Index());
+      if (it->GetDstArgIndex() != 0 || consumer->GetExecutionProviderType() != q_node.GetExecutionProviderType()) {
+        return std::nullopt;
       }
-      dq_nodes.insert(dq_nodes.begin(), dq_node);
-    } else {
-      dq_nodes.push_back(dq_node);
+
+      if (QDQ::MatchDQNode(*consumer)) {
+        if (!HasNoBlockSize(*consumer) ||
+            ElemType(*consumer->OutputDefs()[0]) != ONNX_NAMESPACE::TensorProto_DataType_FLOAT ||
+            !QDQ::IsQDQPairSupported(graph, q_node, *consumer, get_constant_initializer, graph.ModelPath(), false)) {
+          return std::nullopt;
+        }
+
+        const DQLeaf leaf{consumer, producer.Index(), it->GetSrcArgIndex()};
+        if (graph.NodeProducesGraphOutput(*consumer)) {
+          if (&producer != &q_node || has_graph_output_dq) {
+            return std::nullopt;
+          }
+          has_graph_output_dq = true;
+          tree.dq_leaves.insert(tree.dq_leaves.begin(), leaf);
+        } else {
+          tree.dq_leaves.push_back(leaf);
+        }
+        continue;
+      }
+
+      if (!IsDataMovementOp(*consumer) || graph.NodeProducesGraphOutput(*consumer)) {
+        return std::nullopt;
+      }
+      for (const NodeArg* output : consumer->OutputDefs()) {
+        if (output->Exists() && ElemType(*output) != quantized_type) {
+          return std::nullopt;
+        }
+      }
+      tree.data_movement_nodes.push_back(consumer);
+      producers.push_back(consumer);
     }
   }
 
-  return dq_nodes;
+  return tree;
+}
+
+NodeArg& MakeFloatNodeArg(Graph& graph, const NodeArg& like) {
+  ONNX_NAMESPACE::TypeProto type = *like.TypeAsProto();
+  type.mutable_tensor_type()->set_elem_type(ONNX_NAMESPACE::TensorProto_DataType_FLOAT);
+  return graph.GetOrCreateNodeArg(graph.GenerateNodeArgName(like.Name()), &type);
 }
 
 }  // namespace
@@ -94,31 +152,55 @@ Status QuantizeDequantizeLinearFusion::ApplyImpl(Graph& graph, bool& modified, i
       continue;
     }
 
-    const InlinedVector<Node*> dq_nodes = GetFusableDQs(graph, *q_node, get_constant_initializer);
-    if (dq_nodes.empty()) {
+    std::optional<QuantizedTree> tree = CollectQuantizedTree(graph, *q_node, get_constant_initializer);
+    if (!tree.has_value() || tree->dq_leaves.empty()) {
       continue;
     }
 
-    // The fused node produces the first DQ's output (the graph output, if any); the other DQs' consumers are
-    // rewired to it.
+    // Reuse the output of a direct DQ (the graph output, if any) so its consumers keep their input.
+    const DQLeaf& first = tree->dq_leaves.front();
     auto& q_inputs = q_node->MutableInputDefs();
+    NodeArg& fused_output = first.producer == q_node->Index() ? *first.dq_node->MutableOutputDefs()[0]
+                                                              : MakeFloatNodeArg(graph, *q_inputs[0]);
     Node& fused = graph.AddNode(graph.GenerateNodeName(q_node->Name() + "_QuantizeDequantizeLinear"),
                                 "QuantizeDequantizeLinear", "Fused QuantizeLinear and DequantizeLinear",
-                                {q_inputs[0], q_inputs[1], q_inputs[2]}, {dq_nodes.front()->MutableOutputDefs()[0]},
-                                nullptr, kMSDomain);
+                                {q_inputs[0], q_inputs[1], q_inputs[2]}, {&fused_output}, nullptr, kMSDomain);
     fused.SetExecutionProviderType(q_node->GetExecutionProviderType());
 
-    InlinedVector<NodeIndex> source_nodes;
-    source_nodes.reserve(dq_nodes.size() + 1);
-    source_nodes.push_back(q_node->Index());
-
+    // Disconnect the Q and DQ nodes while the edges still match the quantized node args.
+    InlinedVector<NodeIndex> source_nodes{q_node->Index()};
     graph_utils::MoveAllNodeInputEdges(graph, *q_node, fused);
-    for (Node* dq_node : dq_nodes) {
-      graph_utils::ReplaceDownstreamNodeInput(graph, *dq_node, 0, fused, 0);
-      source_nodes.push_back(dq_node->Index());
+    graph_utils::RemoveNodeOutputEdges(graph, *q_node);
+    for (const DQLeaf& leaf : tree->dq_leaves) {
+      if (leaf.producer != q_node->Index()) {
+        graph.RemoveEdge(leaf.producer, leaf.dq_node->Index(), leaf.producer_output, 0);
+      }
+      source_nodes.push_back(leaf.dq_node->Index());
     }
 
-    graph_utils::RemoveNodeOutputEdges(graph, *q_node);
+    // The data-movement nodes now run on the dequantized float values.
+    InlinedHashMap<const NodeArg*, NodeArg*> float_args{{q_node->OutputDefs()[0], &fused_output}};
+    for (Node* node : tree->data_movement_nodes) {
+      NodeArg*& input = node->MutableInputDefs()[0];
+      const bool reads_q_output = input == q_node->OutputDefs()[0];
+      input = float_args.at(input);
+      for (NodeArg*& output : node->MutableOutputDefs()) {
+        if (output->Exists()) {
+          NodeArg& float_output = MakeFloatNodeArg(graph, *output);
+          float_args.emplace(output, &float_output);
+          output = &float_output;
+        }
+      }
+      if (reads_q_output) {
+        graph.AddEdge(fused.Index(), node->Index(), 0, 0);
+      }
+    }
+
+    for (const DQLeaf& leaf : tree->dq_leaves) {
+      Node& producer = leaf.producer == q_node->Index() ? fused : *graph.GetNode(leaf.producer);
+      graph_utils::ReplaceDownstreamNodeInput(graph, *leaf.dq_node, 0, producer, leaf.producer_output);
+    }
+
     for (NodeIndex index : source_nodes) {
       graph.RemoveNode(index);
     }

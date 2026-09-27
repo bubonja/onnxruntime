@@ -229,8 +229,8 @@ static const char* QuantizeDequantizeLinear_ver1_doc = R"DOC(
 Computes DequantizeLinear(QuantizeLinear(x, y_scale, y_zero_point), y_scale, y_zero_point) with per-tensor
 quantization parameters: y = (saturate(round(x / y_scale) + y_zero_point) - y_zero_point) * y_scale, where round is
 round half to even and saturate clamps to the range of the zero point type. The quantized tensor is not materialized.
-The CPU EP graph optimizer creates this operator from a QuantizeLinear whose consumers are all DequantizeLinear
-nodes with the same scale and zero point.)DOC";
+The CPU EP graph optimizer creates this operator from a QuantizeLinear whose output reaches only DequantizeLinear
+nodes with the same scale and zero point, directly or through data-movement ops such as Transpose or Reshape.)DOC";
 
 ONNX_MS_OPERATOR_SET_SCHEMA(
     QuantizeDequantizeLinear, 1,
